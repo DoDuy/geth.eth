@@ -980,6 +980,91 @@ func (api *API) TraceCall(ctx context.Context, args ethapi.TransactionArgs, bloc
 	return api.traceTx(ctx, tx, msg, new(Context), vmctx, statedb, traceConfig)
 }
 
+// TraceCallMayny ETH
+func (api *API) TraceCallMany(ctx context.Context, txs []ethapi.TransactionArgs, blockNrOrHash rpc.BlockNumberOrHash, config *TraceCallConfig) ([]interface{}, error) {
+	// Try to retrieve the specified block
+	var (
+		err         error
+		block       *types.Block
+		results     = make([]interface{}, len(txs))
+		traceConfig *TraceConfig
+		statedb     *state.StateDB
+		release     StateReleaseFunc
+	)
+	if hash, ok := blockNrOrHash.Hash(); ok {
+		block, err = api.blockByHash(ctx, hash)
+	} else if number, ok := blockNrOrHash.Number(); ok {
+		if number == rpc.PendingBlockNumber {
+			// We don't have access to the miner here. For tracing 'future' transactions,
+			// it can be done with block- and state-overrides instead, which offers
+			// more flexibility and stability than trying to trace on 'pending', since
+			// the contents of 'pending' is unstable and probably not a true representation
+			// of what the next actual block is likely to contain.
+			return nil, errors.New("tracing on top of pending is not supported")
+		}
+		block, err = api.blockByNumber(ctx, number)
+	} else {
+		return nil, errors.New("invalid arguments; neither block nor hash specified")
+	}
+	if err != nil {
+		return nil, err
+	}
+	// try to recompute the state
+	reexec := defaultTraceReexec
+	if config != nil && config.Reexec != nil {
+		reexec = *config.Reexec
+	}
+
+	if config != nil && config.TxIndex != nil {
+		_, _, statedb, release, err = api.backend.StateAtTransaction(ctx, block, int(*config.TxIndex), reexec)
+	} else {
+		statedb, release, err = api.backend.StateAtBlock(ctx, block, reexec, nil, true, false)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	vmctx := core.NewEVMBlockContext(block.Header(), api.chainContext(ctx), nil)
+	vmctx.BaseFee = new(big.Int)
+	vmctx.BlobBaseFee = new(big.Int)
+	// Apply the customization rules if required.
+	if config != nil {
+		config.BlockOverrides.Apply(&vmctx)
+		rules := api.backend.ChainConfig().Rules(vmctx.BlockNumber, vmctx.Random != nil, vmctx.Time)
+
+		precompiles := vm.ActivePrecompiledContracts(rules)
+		if err := config.StateOverrides.Apply(statedb, precompiles); err != nil {
+			return nil, err
+		}
+	}
+	if config != nil {
+		traceConfig = &config.TraceConfig
+	}
+	// Execute the trace
+	for i, tx := range txs {
+		// Execute the trace
+		if err := tx.CallDefaults(api.backend.RPCGasCap(), vmctx.BaseFee, api.backend.ChainConfig().ChainID); err != nil {
+			return nil, err
+		}
+		var (
+			msg   = tx.ToMessage(vmctx.BaseFee, true, true)
+			tx_cf = tx.ToTransaction(types.LegacyTxType)
+		)
+
+		txctx := &Context{TxIndex: i}
+
+		res, err := api.traceTx(ctx, tx_cf, msg, txctx, vmctx, statedb, traceConfig)
+		if err != nil {
+			results[i] = &txTraceResult{Error: err.Error()}
+			continue
+		}
+		results[i] = &txTraceResult{Result: res}
+	}
+
+	return results, nil
+}
+
 // traceTx configures a new tracer according to the provided configuration, and
 // executes the given message in the provided environment. The return value will
 // be tracer dependent.
